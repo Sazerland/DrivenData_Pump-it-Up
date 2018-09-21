@@ -1,0 +1,478 @@
+---
+title: "Pump_it"
+author: "Veronika Tamaio Flores"
+date: "3/26/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#Pump it Up - predicting status of the water pumps in Tanzania
+
+##Introduction
+Water is one of the most important elements for human life. Access to the clean drinking water is crucial for many people all over the world. According to WHO 844 million people lack even basic drinking-water surface. According to UNISEF 500 children die every day from lack of safe water. Many of this happens in deserted regions of Africa. 
+
+Safe water and functioning water pumps can save many lives. This is the moment when data scientist can use their skills to make the world a better place. 
+
+##Important note
+To check the performance on DrivenData competition page please check the following nickname: Sazerland. The best model was submitted on March 31st, 10:55 a.m. with a result of 0.8170.  
+
+##Downloading libraries
+
+```{r libraries, message=F}
+library(dplyr)
+library(MASS)
+library(caret)
+library(VIM)
+library(FSelector)
+library(mice)
+library(randomForest)
+library(lubridate)
+library(ranger)
+```
+
+##Data Reading
+
+Here we read the data and merge together train set with train labels set to find out what influences the status of the pump. 
+
+```{r data}
+train <- read.csv("Pump_it_Up_Data_Mining_the_Water_Table_-_Training_set_values.csv")
+train_l <- read.csv("Pump_it_Up_Data_Mining_the_Water_Table_-_Training_set_labels.csv")
+test <- read.csv("Pump_it_Up_Data_Mining_the_Water_Table_-_Test_set_values.csv")
+
+train <- cbind(train[2:40], status_group=train_l$status_group) #droping id as well
+```
+
+##Data Wrangling
+
+Firstly, we will check if there are any NA's in both train and test datasets. To do that we use not only the usual method but also VIM's beautiful visualization.   
+
+```{r na}
+na.cols <- which(colSums(is.na(train)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+
+df_aggr <- aggr(train, col=mdc(1:2), numbers=TRUE, sortVars=TRUE, labels=names(df), cex.axis=.7, gap=3, ylab=c("Proportion of missingness","Missingness Pattern"))
+
+na.cols <- which(colSums(is.na(test)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+
+df_aggr <- aggr(test, col=mdc(1:2), numbers=TRUE, sortVars=TRUE, labels=names(df), cex.axis=.7, gap=3, ylab=c("Proportion of missingness","Missingness Pattern"))
+```
+
+No NA's were found here. So we proceed to the next step.
+
+Now we will check the levels of the factor variables and summary statistics for the numerical ones.  
+
+```{r inspect}
+glimpse(train)
+
+#Checking for duplicates by id
+sum(duplicated(train_l))
+#No duplicates found
+
+#Recoding date to appropriate format
+train$date_recorded <- as.POSIXct(train$date_recorded)
+
+#Droping the column recorded_by: 100% of rows have the same information which means the variables can't be used in solving any problem
+train <- train[-19] 
+
+#Droping the column quantity_group due to very big amount of similarity with quantity column 
+train <- train[-33] 
+
+#Changing " " to "Unknown" in public_meeting column
+train$public_meeting <- as.character(train$public_meeting)
+train$public_meeting[train$public_meeting==""] <- "Unknown"
+train$public_meeting <- as.factor(train$public_meeting)
+
+#Changing " " to "Unknown" in permit column
+train$permit <- as.character(train$permit)
+train$permit[train$permit==""] <- "Unknown"
+train$permit <- as.factor(train$permit)
+
+#Changing " " to "Unknown" in funder column
+train$funder <- as.character(train$funder)
+train$funder[train$funder==""] <- "Unknown"
+train$funder <- as.factor(train$funder)
+
+#Changing " " to "Unknown" in installer column
+train$installer <- as.character(train$installer)
+train$installer[train$installer==""] <- "Unknown"
+train$installer <- as.factor(train$installer)
+
+#changing " " to None in scheme_management column
+train$scheme_management <- as.character(train$scheme_management)
+train$scheme_management[train$scheme_management==""] <- "None"
+train$scheme_management <- as.factor(train$scheme_management)
+
+#changing 0 to "Unknown" in funder column
+train$funder <- as.character(train$funder)
+train$funder[train$funder=="0"] <- "Unknown"
+train$funder <- as.factor(train$funder)
+
+#changing 0 to "Unknown" in installer column
+train$installer <- as.character(train$installer)
+train$installer[train$installer=="0"] <- "Unknown"
+train$installer <- as.factor(train$installer)
+```
+
+No we have done preliminary cleaning for train dataset. Now we are going to create new features to find more hidden relations between various variables to improve the model. 
+
+```{r fe}
+#Age_days: finding how much time have passes since the recorded pump's state untill the last record in the dataset  
+last_day <- max(train$date_recorded) 
+train$age_days <- difftime(last_day, train$date_recorded, units="days")
+train$age_days <- as.numeric(as.character(train$age_days))
+
+#Month: extracting month from the date_recorded to drop this column in the future due to the big amount of different values
+train$month <- month(train$date_recorded)
+
+#Day: extracting day from the date_recorded
+train$day <- day(train$date_recorded)
+
+#Season: assigning appropriate season depending on the month of the record. We assume that amount of water and pump's status may have seasonal dependence
+train <- train %>% 
+  mutate(season=as.factor(ifelse(month>=9 & month<12, "Autumn", ifelse(month>=6 & month <9, "Summer", ifelse(month>=3 & month < 6, "Spring", "Winter")))))
+
+#Age_years: calculating the age of the pumps. We assume that status of the pump may depend on its age
+last_year <- 2013
+train <- train %>%
+  mutate(age_years=last_year-construction_year)
+train$age_years[train$age_years==2013] <- 0
+
+#Finally, we discard date_recorded
+train <- train[-2]
+```
+
+Some columns such as funder or installer have to many levels to be used in the model now. So we decided to decrease the number of various levels by grouping them. Inspiration for this part was partly found [here](https://www.dropbox.com/s/rmdbv8ynmfkv5uf/clean_data.R?dl=0)
+
+```{r reduce # of levels}
+#Funder: top-15 levels left, all others grouped in "Others"
+funders <- names(summary(train$funder)[1:15])
+funder <- factor(train$funder, levels=c(funders, "Other"))
+funder[is.na(funder)] <- "Other"
+train$funder <- funder
+
+#Installer: top-15 levels left, all others grouped in "Others"
+installs <- names(summary(train$installer)[1:15])
+install <- factor(train$installer, levels=c(installs, "Other"))
+install[is.na(install)] <- "Other"
+train$installer <- install
+
+#Extraction_type: grouping minor levels
+train$extraction_type[train$extraction_type=="other - mkulima/shinyanga"] <- "other"
+train$extraction_type[train$extraction_type=="india mark iii"] <- "india mark ii"
+train$extraction_type[train$extraction_type=="other - swn 81"] <- "swn 80"
+train$extraction_type <- factor(as.character(train$extraction_type))
+
+#Extraction_type_group: grouping minor levels
+train$extraction_type_group[train$extraction_type_group=="india mark iii"] <- "india mark ii"
+train$extraction_type_group <- factor(as.character(train$extraction_type_group))
+
+#Management: grouping minor levels
+train$management[train$management=="other - school"] <- "other"
+train$management <- factor(as.character(train$management))
+
+#Waterpoint_type: grouping minor levels
+train$waterpoint_type[train$waterpoint_type=="dam"] <- "other"
+train$waterpoint_type <- factor(as.character(train$waterpoint_type))
+
+#Waterpoint_type_group: grouping minor levels
+train$waterpoint_type_group[train$waterpoint_type_group=="dam"] <- "other"
+train$waterpoint_type_group <- factor(as.character(train$waterpoint_type_group))
+```
+
+Now when we reduced the number of levels in different factor variables, we decided to check again what variables left. Than we decided to drop few more variables due to similarities with others or due to unique or almost unique names which don't help us to predict the status of the pump. 
+
+```{r additional drop}
+glimpse(train)
+
+#Additional dropp
+train <- train[-7] #wpt_name
+train <- train[-7] #num_private
+train <- train[-8] #subvillage
+train <- train[-12] #ward
+train <- train[-15] #scheme_name
+train <- train[-11] #lga
+```
+
+Our train dataset is now ready to training the model! But before that we perform all the data wrangling to the test dataset.
+
+```{r prepare test}
+#Recoding the date
+test$date_recorded <- as.POSIXct(test$date_recorded)
+
+#First dropp
+test <- test[-20] #recorded_by
+test <- test[-34] #quantity_group
+
+#Changing " " to "Unknown" in various columns
+test$public_meeting <- as.character(test$public_meeting)
+test$public_meeting[test$public_meeting==""] <- "Unknown"
+test$public_meeting <- as.factor(test$public_meeting)
+
+test$permit <- as.character(test$permit)
+test$permit[test$permit==""] <- "Unknown"
+test$permit <- as.factor(test$permit)
+
+test$funder <- as.character(test$funder)
+test$funder[test$funder==""] <- "Unknown"
+test$funder <- as.factor(test$funder)
+
+test$installer <- as.character(test$installer)
+test$installer[test$installer==""] <- "Unknown"
+test$installer <- as.factor(test$installer)
+
+#Changing " " to None in various columns
+test$scheme_management <- as.character(test$scheme_management)
+test$scheme_management[test$scheme_management==""] <- "None"
+test$scheme_management <- as.factor(test$scheme_management)
+
+#Changing 0 to "Unknown" in variious columns
+test$funder <- as.character(test$funder)
+test$funder[test$funder=="0"] <- "Unknown"
+test$funder <- as.factor(test$funder)
+
+test$installer <- as.character(test$installer)
+test$installer[test$installer=="0"] <- "Unknown"
+test$installer <- as.factor(test$installer)
+
+#Feature engeneering
+
+#Age_days
+last_day <- max(test$date_recorded) 
+test$age_days <- difftime(last_day, test$date_recorded, units="days")
+test$age_days <- as.numeric(as.character(test$age_days))
+
+#Month
+test$month <- month(test$date_recorded)
+
+#Day
+test$day <- day(test$date_recorded)
+
+#Season
+test <- test %>% 
+  mutate(season=as.factor(ifelse(month>=9 & month<12, "Autumn", ifelse(month>=6 & month <9, "Summer", ifelse(month>=3 & month < 6, "Spring", "Winter")))))
+
+#Age_years
+last_year <- 2013
+test <- test %>%
+  mutate(age_years=last_year-construction_year)
+test$age_years[test$age_years==2013] <- 0
+
+#Discarding of date
+test <- test[-3]
+
+#Reducing number of levels
+
+#Funder
+funders <- names(summary(test$funder)[1:15])
+funder <- factor(test$funder, levels=c(funders, "Other"))
+funder[is.na(funder)] <- "Other"
+test$funder <- funder
+
+#Installer
+installs <- names(summary(test$installer)[1:15])
+install <- factor(test$installer, levels=c(installs, "Other"))
+install[is.na(install)] <- "Other"
+test$installer <- install
+
+#Extraction_type
+test$extraction_type[test$extraction_type=="other - mkulima/shinyanga"] <- "other"
+test$extraction_type[test$extraction_type=="india mark iii"] <- "india mark ii"
+test$extraction_type[test$extraction_type=="other - swn 81"] <- "swn 80"
+test$extraction_type <- factor(as.character(test$extraction_type))
+
+#Extraction_type_group
+test$extraction_type_group[test$extraction_type_group=="india mark iii"] <- "india mark ii"
+test$extraction_type_group <- factor(as.character(test$extraction_type_group))
+
+#Management
+test$management[test$management=="other - school"] <- "other"
+test$management <- factor(as.character(test$management))
+
+#Waterpoint_type
+test$waterpoint_type[test$waterpoint_type=="dam"] <- "other"
+test$waterpoint_type <- factor(as.character(test$waterpoint_type))
+
+#Waterpoint_type_group
+test$waterpoint_type_group[test$waterpoint_type_group=="dam"] <- "other"
+test$waterpoint_type_group <- factor(as.character(test$waterpoint_type_group))
+
+#Additional dropp
+test <- test[-8] #wpt_name
+test <- test[-8] #num_private
+test <- test[-9] #subvillage
+test <- test[-13] #ward
+test <- test[-16] #scheme_name
+test <- test[-12] #lga
+```
+
+One may think that we left some overlapping variables such as extraction_type, its group and class or management and its group etc. For now we are not sure which of them will show as more important according to the model created. So we decided to leave them now.
+
+##Feature importance
+
+We used chi.squared function from FSelector package to find out which features influence the pump's status the most  
+
+```{r chi}
+chi <- chi.squared(status_group~., train)
+chi <- cbind(attr=row.names(chi), chi)
+chi <- chi %>%
+  arrange(desc(attr_importance))
+chi
+```
+
+Now we can clearly see what all features in train dataset are somehow important for defining the status of the given pump. To create our first model we decided to start with those features that have at least 0.15 attribute importance. For the similar features such as extraction_type, class and group we decided to take into consideration only the one with the highest importance. 
+
+##First model
+
+Our problem is classification problem as far as we need to assign one of the classes to the given pump. So we decided to use trees to classify the pumps. To decrease bias we chose Random Forest among all the tree models.
+
+```{r first model}
+#Seting seed to reproduce the results further
+set.seed(42)
+
+#Training the model
+model_forest <- randomForest(as.factor(status_group) ~ quantity + waterpoint_type + extraction_type + longitude + region_code + latitude + payment + amount_tsh + age_years + funder + age_days,
+                             data = train, importance = TRUE,
+                             ntree = 500, nodesize = 2)
+
+#Predicting using the training values
+pred_forest_train <- predict(model_forest, train)
+#Checking confusion matrix for training values
+confusionMatrix(pred_forest_train, train$status_group)
+
+# Predict using the test values
+pred_forest_test <- predict(model_forest, test)
+
+#Writting submission
+submission <- data.frame(test$id)
+submission$status_group <- pred_forest_test
+names(submission)[1] <- "id"
+write.csv(submission, file="solution.csv", row.names=F)
+```
+
+We achieved accuracy of 0.9315. This result may be caused by overfitting so we submited the models result to check that. After submiting the first model to DrivenData, we achieve result of 0.8049. Now we see that this model was overfitting. We decided to proceed with model creation and to check the balance between clasess.    
+
+##Creating dummy variables
+
+To increase model's performance we decided to create dummy variables from all the categorical variables exept the one we need to classify with. Inspiration for this part of code can be found [here](https://www.dropbox.com/s/rkxg8whc0c9n0wq/dummy.R?dl=0)
+```{r dummy}
+#Creating new datasets to play with
+train_d <- cbind(id=train_l$id, train)
+status_group <- train$status_group
+train_d <- train_d[-32]
+
+test_d <- test
+
+#Creating dummy variables for train dataset
+dummies <- dummyVars(id ~ ., data = train_d)
+train2 <- as.data.frame(predict(dummies, newdata = train_d))
+train2 <- train2[-1]
+#Binding the result with the label
+train2 <- cbind(train2, status_group=status_group)
+
+#Creating dummy variables for test dataset
+dummies <- dummyVars(id ~ ., data = test_d)
+test2 <- as.data.frame(predict(dummies, newdata = test_d))
+```
+
+After creating dummy variable we have now 210 columns instead of 35.
+Now we will again check the variable importance and create the model
+
+##Feature importance for new datasets with dummy variables
+
+```{r chi dummies}
+chi_dumm <- chi.squared(status_group~., train2)
+chi_dumm <- cbind(attr=row.names(chi_dumm), chi_dumm)
+chi_dumm <- chi_dumm %>%
+  arrange(desc(attr_importance))
+chi_dumm
+```
+
+After performing chi square on the new train dataset we observed that some names have spaces or / between the words. We need to fix this before putting them into the model  
+
+```{r rename cols}
+names(train2)[names(train2)=="payment.never pay"] <- "payment.never_pay"
+names(test2)[names(test2)=="payment.never pay"] <- "payment.never_pay"
+
+names(train2)[names(train2)=="waterpoint_type.communal standpipe"] <- "waterpoint_type.communal_standpipe"
+names(test2)[names(test2)=="waterpoint_type.communal standpipe"] <- "waterpoint_type.communal_standpipe"
+
+names(train2)[names(train2)=="payment.pay monthly"] <- "payment.pay_monthly"
+names(test2)[names(test2)=="payment.pay monthly"] <- "payment.pay_monthly"
+
+names(train2)[names(train2)=="waterpoint_type.communal standpipe multiple"] <- "waterpoint_type.communal_standpipe_mult"
+names(test2)[names(test2)=="waterpoint_type.communal standpipe multiple"] <- "waterpoint_type.communal_standpipe_mult"
+
+names(train2)[names(train2)=="funder.Government Of Tanzania"] <- "funder.Government_Of_Tanzania"
+names(test2)[names(test2)=="funder.Government Of Tanzania"] <- "funder.Government_Of_Tanzania"
+
+names(train2)[names(train2)=="payment.pay per bucket"] <- "payment.per_bucket"
+names(test2)[names(test2)=="payment.pay per bucket"] <- "payment.per_bucket"
+
+names(train2)[names(train2)=="payment.pay annually"] <- "payment.pay_annually"
+names(test2)[names(test2)=="payment.pay annually"] <- "payment.pay_annually"
+
+names(train2)[names(train2)=="basin.Ruvuma / Southern Coast"] <- "basin.Ruvuma_Southern_Coast"
+names(test2)[names(test2)=="basin.Ruvuma / Southern Coast"] <- "basin.Ruvuma_Southern_Coast"
+
+names(train2)[names(train2)=="management.water board"] <- "management.water_board"
+names(test2)[names(test2)=="management.water board"] <- "management.water_board"
+
+names(train2)[names(train2)=="extraction_type.nira/tanira"] <- "extraction_type.nira_tanira"
+names(test2)[names(test2)=="extraction_type.nira/tanira"] <- "extraction_type.nira_tanira"
+
+names(train2)[names(train2)=="waterpoint_type.hand pump"] <- "waterpoint_type.hand_pump"
+names(test2)[names(test2)=="waterpoint_type.hand pump"] <- "waterpoint_type.hand_pump"
+
+names(train2)[names(train2)=="scheme_management.Water Board"] <- "scheme_management.Water_Board"
+names(test2)[names(test2)=="scheme_management.Water Board"] <- "scheme_management.Water_Board"
+```
+
+Now we are checking the between class balance because we are assuming that the dataset is imbalanced.   
+
+```{r balance check}
+summary(train2$status_group)
+```
+
+We can see that "functional needs repair" class stands for only 4317 rows out of 59400, which is roughly 7% of the total. That means we need to use additional options for the dataset balance. We decided to use "classwt" argument of randomForest funcion. This argument stands for priors of classes.
+
+##Final model
+
+We decided to choose features with importance of more than 0.1 (51 feature) to be the part of the final model.    
+
+```{r with classwt}
+set.seed(42)
+
+model_forest <- randomForest(as.factor(status_group) ~ quantity.dry + waterpoint_type.other + extraction_type.other + quantity.enough + longitude + region_code + latitude + construction_year + age_years + extraction_type.gravity + water_quality.unknown + payment.never_pay + waterpoint_type.communal_standpipe + age_days + region.Iringa + water_quality.soft + quality_group.good + payment.pay_monthly +  management.vwc + gps_height + region.Kigoma + population + waterpoint_type.communal_standpipe_mult + funder.Government_Of_Tanzania + district_code + payment.per_bucket + payment.pay_annually + extraction_type_class.handpump + source.spring + payment.unknown + source.river + extraction_type.nira_tanira + month + basin.Ruvuma_Southern_Coast + funder.Other + management.water_board + scheme_management.VWC,
+                             data = train2, importance = T,
+                             ntree = 500, mtry=6, nodesize = 2,                                        classwt=c(.54, 0.07, .39))
+
+# Predicting using the training values
+pred_forest_train <- predict(model_forest, train2)
+#Checking confusion matrix for training values
+confusionMatrix(pred_forest_train, train2$status_group)
+tail(model_forest$err.rate)
+
+# Predicting using the test values
+pred_forest_test <- predict(model_forest, test2)
+
+#Writting submission
+submission <- data.frame(test$id)
+submission$status_group <- pred_forest_test
+names(submission)[1] <- "id"
+write.csv(submission, file="solution.csv", row.names=F)
+```
+
+##Explaining the model
+After uploading this models predictions into DrivenData, we got the result of 0.8170 which is considerably better than the previous one. 
+
+Random Forest is one of the so called "black box algorithms" which means it is hard or almost impossible to evaluate each variable's impact on the model. But still we can say something about the model in general. 
+
+Accuracy is not the best metric to explain the model based on imbalanced dataset, so we are using Kappa statistic to interpret the model. The value for this statistic is 0.8425, which means that we have an excellent result in assigning correctly in more than 4/5 cases.
+
+While checking the error rate we can observe that final OOB error which is the overall error rate is 0.1878 and the error rate for the minority class is 0.7097 which means that the vast majority of errors are connected with this class while the errors connected to the second class (by number of entries) is 0.2212 and the majority class stands for only 0.0943. Having more balanced dataset may solve this problem.
+
+Thank you for your time and such an interesting task! 
+
+P.S. For some reason the "importance" function just stopped worked for me in the day of deadline. That's why it is not included here. 
